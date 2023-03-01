@@ -1,0 +1,1067 @@
+---
+title: "Teee scRNA-seq"
+author: "Brian Thompson"
+date: "2023-01-05"
+output:
+  html_document: default
+  pdf_document: default
+  word_document: default
+fig_width: 8
+fig_height: 8
+---
+
+```{r load packages, include=TRUE}
+knitr::opts_knit$set(root.dir = "/Users/brianthompson/Desktop/scRNA-seq /Published_Melanoma")
+knitr::opts_chunk$set(message = FALSE, results = "hide")
+library(tidyverse)
+library(Seurat)
+library(patchwork)
+library(DESeq2)
+library(magrittr)
+library(cowplot)
+library(survival)
+library(survminer)
+library(gtsummary)
+library(plyr)
+library(readr)
+library(EnhancedVolcano)
+library(corrplot)
+```
+
+#First Melanoma Dataset
+GSE120575
+
+```{r Read in Melanoma Dataset 1}
+df <- read_delim("GSE120575_Sade_Feldman_melanoma_single_cells_TPM_GEO.txt", delim = "\t", escape_double = FALSE, col_names = FALSE, trim_ws = TRUE)
+annotation <- read_delim("GSE120575_patient_ID_single_cells.txt", delim = "\t") 
+```
+
+Formatting dataset for suerat
+
+```{r data formating}
+df_1 <- df[-2,]
+df_matrix <- df_1
+df_matrix <- as.data.frame(df_matrix)
+df_matrix[1,1] <- "Names"
+row.names(df_matrix) <- df_matrix[,1]
+rows <- df_matrix[,1]
+rows <- rows[-1]
+df_matrix <- df_matrix[,-1]
+names_df <-df_matrix[1,]
+colnames(df_matrix) <- names_df
+df_matrix <- df_matrix[-1,]
+
+df_matrix_list <- sapply( df_matrix, as.numeric )
+df_matrix_list <- as.data.frame(df_matrix_list)
+row.names(df_matrix_list) <- rows
+```
+
+Create a seurat object for the melanoma data
+
+```{r create seurat object}
+melanoma <- CreateSeuratObject(counts = df_matrix_list, project = "melanoma", min.cells = 30, min.features = 100)
+updated_annotation <- annotation[-1:-16,]
+updated_annotation[1,5] <- "Time"
+updated_annotation[1,6] <- "Response"
+colnames(updated_annotation)<-updated_annotation[1,]
+updated_annotation <- updated_annotation[-1,]
+updated_annotation$Combined<-paste(updated_annotation$Time, updated_annotation$Response,sep=",")
+updated_annotation %<>% select(title, Time, Response, Combined)
+new_anno <- updated_annotation %>% select(Time, Response, title, Combined)
+new_anno <- as.data.frame(new_anno)
+new_anno <- subset(new_anno, Time != "NA") 
+new_anno <- subset(new_anno, Time != "read length")
+rownames(new_anno)=rownames(melanoma@meta.data)
+melanoma = AddMetaData(melanoma, new_anno)
+```
+
+Check for cell viability issues/bias
+
+```{r assessing mitochondrial contamination}
+#Determining the prefix of mitochondrial reads
+grep(glob2rx("*ATP6"), rownames(df_matrix_list), value = TRUE) #This command will allow me to identify the mitochondrial prefix 
+
+#Determine mito percentage
+melanoma[["percent.mt"]] <- PercentageFeatureSet(melanoma, pattern = "^MT-")
+Idents(object = melanoma) <- "Melanoma"
+VlnPlot(melanoma, features = "percent.mt", combine = TRUE, ncol = 1)
+```
+
+There is no evidence of cell viability issues. Therefore, no need to filter on mitochondrial %. 
+
+
+Standard normalization pipeline of scRNA-seq data 
+
+```{r scRNA-seq pipeline}
+melanoma <- FindVariableFeatures(melanoma, selection.method = "vst", nfeatures = 10000)
+all.genes <- rownames(melanoma)
+melanoma <- ScaleData(melanoma, features = all.genes)
+```
+
+Need to subset the data to only CD4+ T-cells 
+
+```{r subset and PCA, results = FALSE}
+melanoma_sub <- subset(x = melanoma, subset = CD3E > 1 & CD4 > 0.1)
+melanoma_sub <- FindVariableFeatures(melanoma_sub, selection.method = "vst", nfeatures = 10000)
+melanoma_sub <- RunPCA(melanoma_sub, features = VariableFeatures(object = melanoma_sub))
+ElbowPlot(melanoma_sub)
+```
+
+
+Elbow plot indicates that the first 5 PCs should be used to create the UMAP
+
+```{r subset and UMAP, results = FALSE}
+melanoma_sub <- FindNeighbors(melanoma_sub, dims = 1:5)
+melanoma_sub <- FindClusters(melanoma_sub, resolution = 0.5)
+melanoma_sub <- RunUMAP(melanoma_sub, dims = 1:5)
+melanoma_UMAP <- DimPlot(melanoma_sub, reduction = "umap", label = TRUE)
+melanoma_UMAP
+pdf("Final_Melanoma_UMAP_updated.pdf", height = 8, width = 8)
+melanoma_UMAP
+dev.off()
+```
+
+
+Analyzing for the presence of Teee cells based on the Teee gene signature identified in the 
+RNA-seq analysis of flow sorted Teee cells
+
+```{r Teee signature}
+teee_list <- read.csv("~/Downloads/Upregulated Consensus Genes.csv")
+teee_list <- tibble(teee_list)
+teee_list %<>% dplyr::select("gene")
+teee_list %<>% dplyr::add_row(gene = c("CD4", "ENTPD1"))
+object <- AddModuleScore(object = melanoma_sub, features = teee_list, name = "teee_list", search = TRUE)
+teee_sig <- FeaturePlot(object = object, features = "teee_list1", cols = c("blue", "light blue",
+                                                                "orange", "red"))  +
+  labs(title = "Cells Enriched in Teee Signature") + theme(legend.position= c(0.92,0.9))
+teee_sig
+pdf("Final_Melanoma_UMAP_Teee_sig.pdf", height = 8, width = 8)
+teee_sig
+dev.off()
+
+
+```
+
+Analyzing data for discrimination on patient response
+
+```{r Patient Response}
+plot_umap_response <- DimPlot(
+    melanoma_sub,
+    reduction = "umap",
+    group.by = "Response",
+    label = FALSE , 
+    cols = c('Responder' = 'blue', 'Non-responder' = 'red'), 
+    ) +
+  theme(legend.position= c(0.75,0.1)) + theme(plot.title = element_blank())
+plot_umap_response
+pdf("Final_Melanoma_UMAP_Response.pdf", height = 8, width = 8)
+plot_umap_response
+dev.off()
+```
+
+Evaluating patient bias 
+
+```{r Patient bias}
+DimPlot(
+  melanoma_sub,
+  reduction = "umap",
+  group.by = "Time",
+  label = FALSE 
+) +
+  theme(legend.position= c(10,10)) + theme(plot.title = element_blank())
+```
+
+No strong evidence for patient bias
+
+Identifying phenotypes of the cluster with a dotplot
+
+```{r Melanoma dotplot}
+Teee_select_genes <- c("CD38", "ENTPD1", "MKI67", "PCNA", "TOP2A", "CTLA4", "PDCD1", "LAG3", "HAVCR2", 
+                       "ICOS", "CD274", "PDCD1LG2", "TOX", "TCF7", "CASP3", "BCL2", "IFNG", "TNF", 
+                       "TGFB1", "IL2RA", "FOXP3")
+melanoma_dotplot <- DotPlot(melanoma_sub, features = Teee_select_genes, dot.scale = 10, scale = TRUE) +
+  RotatedAxis() + scale_color_gradientn(colours = c("black", "dark blue", "light blue", "grey", "yellow", "orange", "red", "dark red"))
+melanoma_dotplot
+pdf("Final_Melanoma_dotplot_01.27.pdf", height = 8, width = 8)
+melanoma_dotplot
+dev.off()
+```
+
+Quantification of Teee cells within each patient and comparison between Non-responder and Responders
+
+```{r Teee quantification}
+ID <- melanoma_sub@meta.data$Time
+ID <- unique(ID)
+test <- lapply(ID, print)
+
+GOI1 <- 'CD38' 
+GOI2 <- 'ENTPD1' 
+GOI1.cutoff <- 0.1 
+GOI2.cutoff <- 0.1 
+output <- vector("double")
+for (patient in test){
+  result_patient <- subset(melanoma_sub, subset = (Time == patient))
+  GOI1_GOI2.cells <- length(which( FetchData(result_patient, vars = GOI2) > GOI2.cutoff & FetchData(result_patient, vars = GOI1) > GOI1.cutoff))
+  all.cells.incluster <- table(result_patient@meta.data$Response)
+  p <- GOI1_GOI2.cells/all.cells.incluster*100 
+  p1 <- as.data.frame(p)
+  output[[patient]] <- as.numeric(p)
+}
+test_output <- as_tibble(output)
+test_output %<>% mutate(Patient = ID)
+
+test_output %<>% mutate(Response= case_when(Patient == "Pre_P1" ~ "Responder", 
+                                           Patient == "Post_P1" ~ "Responder", 
+                                           Patient == "Post_P4" ~ "Responder",
+                                           Patient == "Post_P5_2" ~ "Responder",
+                                           Patient == "Pre_P7"  ~ "Responder",
+                                           Patient == "Pre_P8"  ~ "Responder",
+                                           Patient == "Post_P8" ~ "Responder",
+                                           Patient == "Post_P17" ~ "Responder",
+                                           Patient == "Post_P19"  ~ "Responder",
+                                           Patient == "Post_P21"  ~ "Responder",
+                                           Patient == "Pre_P24"  ~ "Responder",
+                                           Patient == "Pre_P26"  ~ "Responder",
+                                           Patient == "Pre_P28"  ~ "Responder",
+                                           Patient == "Pre_P29"  ~ "Responder",
+                                           Patient == "Pre_P33"  ~ "Responder",
+                                           Patient == "Pre_P35"  ~ "Responder",
+                                           TRUE ~ "Non_Responder"))
+
+#####Going to remove the extra patient samples
+trimmed <- test_output
+trimmed[c('Patient', 'Time')] <- str_split_fixed(trimmed$Patient, '_', 2)
+trimmed %<>% filter(Patient == "Pre")
+NR_df <- trimmed %>% filter(Response == "Non_Responder")
+nr.model <- lm(value ~ 1, NR_df)
+nr.conf <- confint(nr.model, level = 0.95)
+
+R_df <- trimmed %>% filter(Response == "Responder")
+r.model <- lm(value ~ 1, R_df)
+r.conf <- confint(r.model, level = 0.95)
+
+comp <- ggplot(trimmed, aes(Response, value)) +
+  geom_point(aes(color=Response)) +
+  scale_color_manual(values = c("red", "blue")) +
+  theme_bw() +
+  theme(axis.title.x = element_blank(), axis.title.y = element_text(size = 12), 
+        axis.text.y = element_text(size = 10, color = "black"),
+        axis.text.x = element_text(size = 10, color = "black")) + 
+  ylab("% Teee (as % of CD4+)") + 
+  stat_compare_means(method = "t.test", label.x = 2, size = 5) + 
+  theme(legend.position="none") + 
+  ggtitle("Pre-treatment") + 
+geom_segment(aes(x = 0.8, y = median(select(filter(trimmed, Response == "Non_Responder"), value)$value), xend = 1.2, yend = median(select(filter(trimmed, Response == "Non_Responder"), value)$value))) + 
+  geom_segment(aes(x = 1.8, y = median(select(filter(trimmed, Response == "Responder"), value)$value), xend = 2.2, yend = median(select(filter(trimmed, Response == "Responder"), value)$value))) + 
+  geom_linerange(aes(x = 1, ymin = nr.conf[1], ymax = nr.conf[2])) + 
+  geom_linerange(aes(x = 2, ymin = r.conf[1], ymax = r.conf[2])) + 
+  geom_segment(aes(x = 0.95, y = nr.conf[1], xend = 1.05, yend = nr.conf[1])) + 
+  geom_segment(aes(x = 0.95, y = nr.conf[2], xend = 1.05, yend = nr.conf[2])) + 
+  geom_segment(aes(x = 1.95, y = r.conf[1], xend = 2.05, yend = r.conf[1])) + 
+  geom_segment(aes(x = 1.95, y = r.conf[2], xend = 2.05, yend = r.conf[2]))
+pdf("Final_Melanoma_Pre_Treatment.pdf", height = 8, width = 8)
+comp
+dev.off()
+write_csv(as.data.frame(trimmed), "Teee_David.csv")
+```
+
+Teee survival analysis
+
+```{r Teee survival analysis}
+#Add the OS data to test_output
+trimmed %<>% mutate(Teee_cat = case_when(value >= median(value) ~ "High",
+                                         TRUE ~ "Low"))
+trimmed %<>% mutate(OS = case_when(Time == "P1" ~ 822, 
+                                            Time == "P2" ~ 347, 
+                                   Time == "P3" ~ 521,
+                                   Time == "P4" ~ 539,
+                                   Time == "P6"  ~ 777,
+                                   Time == "P7"  ~ 339,
+                                   Time == "P8" ~ 388,
+                                   Time == "P12" ~ 101,
+                                   Time == "P15"  ~ 163,
+                                   Time == "P20"  ~ 413,
+                                   Time == "P24"  ~ 54,
+                                   Time == "P25"  ~ 676,
+                                   Time == "P26"  ~ 517,
+                                   Time == "P27"  ~ 73,
+                                   Time == "P28"  ~ 61,
+                                   Time == "P29"  ~ 417,
+                                   Time == "P31"  ~ 126,
+                                   Time == "P33"  ~ 130,
+                                   Time == "P35"  ~ 511,
+                                            TRUE ~ 0))
+
+
+trimmed %<>% mutate(Censor = case_when(Time == "P1" ~ 0, 
+                                   Time == "P2" ~ 1, 
+                                   Time == "P3" ~ 1,
+                                   Time == "P4" ~ 0,
+                                   Time == "P6"  ~ 0,
+                                   Time == "P7"  ~ 0,
+                                   Time == "P8" ~ 0,
+                                   Time == "P12" ~ 1,
+                                   Time == "P15"  ~ 1,
+                                   Time == "P20"  ~ 0,
+                                   Time == "P24"  ~ 0,
+                                   Time == "P25"  ~ 0,
+                                   Time == "P26"  ~ 0,
+                                   Time == "P27"  ~ 0,
+                                   Time == "P28"  ~ 0,
+                                   Time == "P29"  ~ 0,
+                                   Time == "P31"  ~ 0,
+                                   Time == "P33"  ~ 0,
+                                   Time == "P35"  ~ 0,
+                                   TRUE ~ 2))
+surv_plot <- ggsurvplot(
+  fit = survfit(Surv(OS, Censor) ~ Teee_cat, data = trimmed),
+  xlab = "Days",
+  ylab = "Overall Survival",
+  pval = TRUE,
+  risk.table = TRUE,
+  palette = c("blue", "red"),
+  tables.height = 0.3
+)
+pdf("Final_Melanoma_Survival_Plot.pdf", height = 8, width = 8)
+surv_plot
+dev.off()
+```
+
+
+Correlation in gene expression between Teee cells and Treg cluster
+```{r Teee vs Treg correlation}
+treg <- subset(x = melanoma_sub, subset = (seurat_clusters == 5 | seurat_clusters == 4))
+teee_cluster <- subset(x = melanoma_sub, subset = seurat_clusters == 6)
+
+treg_counts <- GetAssayData(object = treg, slot = "scale.data")
+treg_means <- rowMeans(treg_counts)
+treg_means <- as.data.frame(treg_means)
+treg_means[2] <- rownames(treg_means)
+teee_counts <- GetAssayData(object = teee_cluster, slot = "scale.data")
+teee_means <- rowMeans(teee_counts)
+teee_means <- as.data.frame(teee_means)
+teee_means[2] <- rownames(teee_means)
+treg_teee <- join(treg_means, teee_means, by = "V2")
+positive_means <- treg_teee %>% filter(treg_means > 0.1)
+negative_means <- treg_teee %>% filter(treg_means < 0.1)
+ggplot(positive_means, aes(teee_means, treg_means)) + 
+  geom_point() + stat_cor(method = "pearson")
+
+ggplot(negative_means, aes(teee_means, treg_means)) + 
+  geom_point() + stat_cor(method = "pearson", label.x = 2)
+
+ggplot(treg_teee, aes(teee_means, treg_means)) + 
+  geom_point() + stat_cor(method = "pearson")
+```
+
+
+Investigating DEGs between the Teee and Tregs cells
+
+```{r DEGs between Teee and Tregs}
+teee_vs_treg <- FindMarkers(melanoma_sub, ident.1 = 6, ident.2 = 5)
+teee_vs_treg[6] <- rownames(teee_vs_treg)
+teee_vs_treg <- as_tibble(teee_vs_treg)
+keyvals <- ifelse(teee_vs_treg$avg_log2FC < -0.5 & teee_vs_treg$p_val_adj < 0.1, 'royalblue',
+                  ifelse(teee_vs_treg$avg_log2FC > 0.50 & teee_vs_treg$p_val_adj < 0.1, 'red2',
+                         'grey30'))
+keyvals[is.na(keyvals)] <- 'grey30'
+names(keyvals)[keyvals == 'red2'] <- 'Upregulated Teee'
+names(keyvals)[keyvals == 'grey30'] <- 'Non-sig'
+names(keyvals)[keyvals == 'royalblue'] <- 'Upregulated Treg'
+
+EnhancedVolcano(teee_vs_treg,
+                lab = teee_vs_treg$V6,
+                x = "avg_log2FC",
+                y = "p_val_adj", ylab = bquote(~-Log[10] ~ p_val_adj),
+                title = "Teee vs Treg", 
+                subtitle = "", subtitleLabSize = 0.01,
+                cutoffLineType = 'blank',
+                colCustom = keyvals, legendPosition = 'right', 
+                xlim = c(-2,4), ylim = c(0, 75),
+                border = 'full', borderWidth = 0.5, borderColour = 'black',
+                legendLabSize = 11, legendIconSize = 2, caption = "", captionLabSize = 0.0000001, 
+                pCutoff = 0.1,FCcutoff = c(1,2), labSize = 5, drawConnectors = TRUE, arrowheads=FALSE, max.overlaps = 25, 
+                selectLab = c("FOXP3", 
+                              "CXCR6",  "CXCR3", "CCR2", "CTLA4", 
+                              "TNFRSF4",  "IL2RA", "IL2RB", "IKZF2", 
+                              "TNFRSF18", "TNFRSF9", "TNFRSF1B", "FURIN", "CDT1", 
+                              "GCK", "TAFA1", "PCLAF", "CCNA2", "MCM4", "ABCB10", 
+                              "KIF4A", "DHFR", "STK39", "PCNA", "ACOT7" ))
+
+
+
+```
+
+
+Confirm these results in a different melanoma scRNA-seq dataset. 
+Evaluating GSE115978.
+
+```{r Create seurat object from melanoma dataset 2}
+df_new <- read_csv("GSE115978_tpm.csv")
+new_annotation <- read_csv("GSE115978_cell.annotations.csv")
+
+df_matrix_new <- df_new
+df_matrix_new <- as.data.frame(df_matrix_new)
+df_matrix_new[1,1] <- "Names"
+row.names(df_matrix_new) <- df_matrix_new$...1 
+df_matrix_new <- df_matrix_new[,-1]
+df_matrix_new <- df_matrix_new[-1,]
+```
+
+
+Creating a seurat object with the new melanoma dataset
+
+```{r Reading in and formatting a new melanoma dataset}
+melanoma_new <- CreateSeuratObject(counts = df_matrix_new, project = "melanoma_new", min.cells = 10, min.features = 10)
+Idents(object = melanoma_new) <- "Melanoma"
+melanoma_new <- AddMetaData(melanoma_new, new_annotation$samples, 'Sample')
+```
+
+
+Analyzing cell viability
+
+```{r Cell viability in new melanoma dataset}
+grep(glob2rx("*ATP*"), rownames(df_matrix_new), value = TRUE) 
+```
+Mitochondrial reads are not in the dataset. 
+
+
+
+```{r scRNA-seq pipeline on new melanoma dataset}
+melanoma_new <- FindVariableFeatures(melanoma_new, selection.method = "vst", nfeatures = 10000)
+all.genes <- rownames(melanoma_new)
+melanoma_new <- ScaleData(melanoma_new, features = all.genes)
+```
+
+
+Need to subset the data to only CD4+ T-cells 
+
+```{r subset and PCA on new melanoma dataset, results = FALSE}
+melanoma_new_sub <- subset(x = melanoma_new, subset = CD3E > 0.5 & PTPRC > 0.1 & CD4 > 0.1)
+melanoma_new_sub <- FindVariableFeatures(melanoma_new_sub, selection.method = "vst", nfeatures = 10000)
+melanoma_new_sub <- RunPCA(melanoma_new_sub, features = VariableFeatures(object = melanoma_new_sub))
+ElbowPlot(melanoma_new_sub)
+```
+
+Elbow plot indicates that the first 8 PCs should be used to create the UMAP
+
+```{r subset and UMAP on melanoma dataset 2, results = FALSE}
+melanoma_new_sub <- FindNeighbors(melanoma_new_sub, dims = 1:8)
+melanoma_new_sub <- FindClusters(melanoma_new_sub, resolution = 0.8)
+melanoma_new_sub <- RunUMAP(melanoma_new_sub, dims = 1:8)  
+new_UMAP <- DimPlot(melanoma_new_sub, reduction = "umap", label = TRUE)
+pdf("Final_New_Melanoma_UMAP.pdf", height = 8, width = 8)
+new_UMAP
+dev.off()
+```
+
+Analyzing for the presence of Teee cells based on the Teee gene signature identified in the 
+RNA-seq analysis of flow sorted Teee cells
+
+```{r Teee signature on new melanoma dataset}
+object <- AddModuleScore(object = melanoma_new_sub, features = teee_list, name = "teee_list", search = TRUE)
+new_teee_sig <- FeaturePlot(object = object, features = "teee_list1", cols = c("blue", "light blue",
+                                                                "orange", "red"))  +
+  labs(title = "Cells Enriched in Teee Signature") + theme(legend.position= c(0.92,0.9))
+pdf("Final_New_Melanoma_Teee_sig.pdf", height = 8, width = 8)
+new_teee_sig
+dev.off()
+```
+
+Evaluating patient bias 
+
+```{r Patient bias in new melanoma dataset}
+DimPlot(
+  melanoma_new_sub,
+  reduction = "umap",
+  group.by = "Sample",
+  label = FALSE 
+) +
+  theme(legend.position= c(10,10)) + theme(plot.title = element_blank()) 
+```
+
+No evidence of patient bias.
+
+Identifying phenotypes of the cluster with a dotplot
+
+```{r Melanoma dotplot dataset 2}
+Teee_select_genes <- c("CD38", "ENTPD1", "MKI67", "PCNA", "TOP2A", "CTLA4", "PDCD1", "LAG3", "HAVCR2", 
+                       "ICOS", "CD274", "PDCD1LG2", "TOX", "TCF7", "CASP3", "BCL2", "IFNG", "TNF", 
+                       "TGFB1", "IL2RA", "FOXP3")
+
+new_melanoma_dotplot <- DotPlot(melanoma_new_sub, features = Teee_select_genes, dot.scale = 10, scale = TRUE) +
+  RotatedAxis() + scale_color_gradientn(colours = c("black", "dark blue", "light blue", "grey", "yellow", "orange", "red", "dark red"))
+pdf("Final_New_Melanoma_dotplot_1.27.pdf", height = 8, width = 8)
+new_melanoma_dotplot
+dev.off()
+```
+
+
+Comparing Teee cells from different melanoma datasets
+```{r Teee melanoma 1 vs melanoma 2}
+teee_means ###These are the Teee cells from the first melaanoma dataset 
+teee_cluster_2 <- subset(x = melanoma_new_sub, subset = seurat_clusters == 9)
+
+teee_counts_2 <- GetAssayData(object = teee_cluster_2, slot = "scale.data")
+teee_means_2 <- rowMeans(teee_counts_2)
+teee_means_2 <- as.data.frame(teee_means_2)
+teee_means_2[2] <- rownames(teee_means_2)
+teee_teee <- join(teee_means, teee_means_2, by = "V2")
+positive_means <- teee_teee %>% filter(teee_means > 0.1)
+negative_means <- teee_teee %>% filter(teee_means < 0.1)
+ggplot(positive_means, aes(teee_means, teee_means_2)) + 
+  geom_point() + stat_cor(method = "pearson")
+
+ggplot(negative_means, aes(teee_means, teee_means_2)) + 
+  geom_point() + stat_cor(method = "pearson", label.x = 0)
+
+ggplot(teee_teee, aes(teee_means, teee_means_2)) + 
+  geom_point() + stat_cor(method = "pearson")
+
+```
+
+
+Confirm the presence of Teee cells in other tumor types. 
+First look at bladder cancer from GSE149652. 
+
+```{r Read in and format bladder cancer data}
+data_dir <- "/Users/brianthompson/Desktop/scRNA-seq /Published_Melanoma/Bladder_Cancer"
+genes <- read.csv("/Users/brianthompson/Desktop/scRNA-seq /Published_Melanoma/Bladder_Cancer/features.csv.gz")
+barcodes <- read.csv("/Users/brianthompson/Desktop/scRNA-seq /Published_Melanoma/Bladder_Cancer/barcodes.csv.gz")
+
+names <- genes$index
+rownames(genes) <- names
+genes <- genes[,-1]
+```
+
+Create seurat object. 
+
+```{r Create suerat object from bladder cancer data}
+bladder <- CreateSeuratObject(counts = genes, project = "bladder", min.cells = 30, min.features = 100)
+bladder <- AddMetaData(bladder, barcodes$batch, 'batch')
+bladder <- AddMetaData(bladder, barcodes$patient, 'patient')
+bladder <- AddMetaData(bladder, barcodes$tissue, 'tissue')
+bladder <- AddMetaData(bladder, barcodes$Sample_ID, 'sample_id')
+bladder <- AddMetaData(bladder, barcodes$cell_origin, 'cell_origin')
+```
+
+Analyze cell viability. 
+
+```{r Cell viability of bladder cancer data}
+grep(glob2rx("*ATP6"), names, value = TRUE) 
+bladder[["percent.mt"]] <- PercentageFeatureSet(bladder, pattern = "^MT-")
+Idents(object = bladder) <- "bladder"
+VlnPlot(bladder, "percent.mt")
+VlnPlot(bladder, features = c("CD4", "CD8A", "PTPRC", "CD3E"), combine = TRUE, ncol = 2) 
+```
+
+Do not need to remove low viability cells. 
+
+```{r scale and normalize bladder cancer data}
+bladder_sub <- subset(x = bladder, subset = PTPRC > 1 & CD3E > 1)
+bladder_sub <- FindVariableFeatures(bladder_sub, selection.method = "vst", nfeatures = 10000)
+bladder_sub <- ScaleData(bladder_sub)
+bladder_sub <- RunPCA(bladder_sub, features = VariableFeatures(object = bladder_sub))
+ElbowPlot(bladder_sub)
+```
+
+
+Elbow plot indicates that the first 8 PCs should be used to create the UMAP
+Splitting dataset into healthy tissue and normal tissue and then analyzing.
+
+```{r UMAP of bladder cancer dataset healthy tissue, results = FALSE}
+H <- subset(bladder_sub, subset = (tissue == "Normal"))
+H <- FindVariableFeatures(H, selection.method = "vst", nfeatures = 2000)
+H <- RunPCA(H, features = VariableFeatures(object = H))
+ElbowPlot(H)
+H <- FindNeighbors(H, dims = 1:8)
+H <- FindClusters(H, resolution = 1.0)
+H <- RunUMAP(H, dims = 1:8)
+DimPlot(H, reduction = "umap", label = TRUE)
+H <- AddModuleScore(H, features = teee_list, name= "Teee")
+FeaturePlot(object = H, features = "Teee1", cols = c("blue", "light blue",
+                                                           "orange", "red"))  +
+  labs(title = "Cells Enriched in Teee Signature") + theme(legend.position= c(0.1,0.85))
+
+Tumor <- subset(bladder_sub, subset = (tissue == "Tumor"))
+Tumor <- FindVariableFeatures(Tumor, selection.method = "vst", nfeatures = 2000)
+Tumor <- ScaleData(Tumor)
+Tumor <- RunPCA(Tumor, features = VariableFeatures(object = Tumor))
+ElbowPlot(Tumor)
+Tumor <- FindNeighbors(Tumor, dims = 1:11)
+Tumor <- FindClusters(Tumor, resolution = 1.5)
+Tumor <- RunUMAP(Tumor, dims = 1:11)
+DimPlot(Tumor, reduction = "umap", label = TRUE)
+Tumor <- AddModuleScore(Tumor, features = teee_list, name= "Teee")
+FeaturePlot(object = Tumor, features = "Teee1", cols = c("blue", "light blue",
+                                                     "orange", "red"))  +
+  labs(title = "Cells Enriched in Teee Signature") + theme(legend.position= c(0.1,0.85))
+```
+
+```{r UMAP of bladder cancer dataset, results = FALSE}
+bladder_sub <- FindNeighbors(bladder_sub, dims = 1:8)
+bladder_sub <- FindClusters(bladder_sub, resolution = 0.8)
+bladder_sub <- RunUMAP(bladder_sub, dims = 1:8)  
+DimPlot(bladder_sub, reduction = "umap", label = TRUE)
+DimPlot(
+  bladder_sub,
+  reduction = "umap",
+  group.by = "patient",
+  label = FALSE 
+   ) +
+  theme(legend.position= c(0.75,0.75)) + theme(plot.title = element_blank())
+DimPlot(
+  Tumor,
+  reduction = "umap",
+  group.by = "patient",
+  label = FALSE 
+   ) +
+  theme(legend.position= c(0.75,0.75)) + theme(plot.title = element_blank())
+```
+
+There is clear patient bias that will need to be controlled for.
+First work on the tumor samples. 
+```{r Controlling for patient bias}
+status.list <- SplitObject(Tumor, split.by = "patient")
+status.list <- lapply(X = status.list, FUN = function(x) {
+  x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 10000)
+})
+
+# select features that are repeatedly variable across datasets for integration
+features <- SelectIntegrationFeatures(object.list = status.list, nfeatures = 10000)
+
+anchors <- FindIntegrationAnchors(object.list = status.list, anchor.features = features)
+
+# this command creates an 'integrated' data assay
+bladder.combined <- IntegrateData(anchorset = anchors)
+
+DefaultAssay(bladder.combined) <- "integrated"
+```
+
+
+```{r Reanalyzing the bladder tumor data}
+bladder.combined <- ScaleData(bladder.combined)
+bladder.combined <- RunPCA(bladder.combined, features = VariableFeatures(object = bladder.combined))
+ElbowPlot(bladder.combined)
+bladder.combined <- FindNeighbors(bladder.combined, reduction = "pca", dims = 1:10)
+bladder.combined <- FindClusters(bladder.combined, resolution = 0.8)
+bladder.combined <- RunUMAP(bladder.combined, reduction = "pca", dims = 1:10)
+bladder_tumor_umap <- DimPlot(bladder.combined, reduction = "umap", label = TRUE)
+pdf("Final_Bladder_Tumor_UMAP.pdf", height = 8, width = 8)
+bladder_tumor_umap
+dev.off()
+```
+
+Searching for Teee cells in patient corrected tumor samples
+
+```{r Teee detection in bladder tumor sample}
+bladder.combined <- AddModuleScore(bladder.combined, features = teee_list, name= "Teee")
+bladder_tumor_teee_sig <- FeaturePlot(object = bladder.combined, features = "Teee1", cols = c("blue", "light blue","orange", "red"))  +
+  labs(title = "Cells Enriched in Teee Signature (Tumor)") + theme(legend.position= c(0.05,0.22))
+pdf("Final_Bladder_Tumor_Teee_sig.pdf", height = 8, width = 8)
+bladder_tumor_teee_sig
+dev.off()
+```
+
+Identifying phenotypes of the cluster with a dotplot
+
+```{r Bladder Tumor Dotplot}
+Teee_select_genes <- c("CD38", "ENTPD1", "MKI67", "PCNA", "TOP2A", "CTLA4", "PDCD1", "LAG3", "HAVCR2", 
+                       "ICOS", "CD274", "PDCD1LG2", "TOX", "TCF7", "CASP3", "BCL2", "IFNG", "TNF", 
+                       "TGFB1", "IL2RA", "FOXP3")
+
+bladder.combined_dotplot <- DotPlot(bladder.combined, features = Teee_select_genes, dot.scale = 10, scale = TRUE) +
+  RotatedAxis() + scale_color_gradientn(colours = c("black", "dark blue", "light blue", "grey", "yellow", "orange", "red", "dark red"))
+pdf("Bladder_Tumor_dotplot_1.27.pdf", height = 8, width = 8)
+bladder.combined_dotplot
+dev.off()
+```
+
+Analysis of healthy adjacent tissue in bladder cancer dataset
+
+```{r Controlling for patient bias in healthy tissue}
+status.list_healthy <- SplitObject(H, split.by = "patient")
+status.list_healthy <- lapply(X = status.list_healthy, FUN = function(x) {
+  x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 10000)
+})
+
+# select features that are repeatedly variable across datasets for integration
+features_healthy <- SelectIntegrationFeatures(object.list = status.list_healthy, nfeatures = 10000)
+
+anchors_healthy <- FindIntegrationAnchors(object.list = status.list_healthy, anchor.features = features)
+
+# this command creates an 'integrated' data assay
+bladder.combined_healthy <- IntegrateData(anchorset = anchors_healthy, k.weight = 30)
+
+DefaultAssay(bladder.combined_healthy) <- "integrated"
+```
+
+```{r Reanalyzing the bladder tumor data healthy tissue}
+bladder.combined_healthy <- ScaleData(bladder.combined_healthy)
+bladder.combined_healthy <- RunPCA(bladder.combined_healthy, features = VariableFeatures(object = bladder.combined_healthy))
+ElbowPlot(bladder.combined_healthy)
+bladder.combined_healthy <- FindNeighbors(bladder.combined_healthy, reduction = "pca", dims = 1:6)
+bladder.combined_healthy <- FindClusters(bladder.combined_healthy, resolution = 0.8)
+bladder.combined_healthy <- RunUMAP(bladder.combined_healthy, reduction = "pca", dims = 1:6)
+bladder_healthy_umap <- DimPlot(bladder.combined_healthy, reduction = "umap", label = TRUE)
+pdf("Bladder_Healthy_UMAP.pdf", height = 8, width = 8)
+bladder_healthy_umap
+dev.off()
+```
+
+
+Searching for Teee cells in patient corrected healthy samples
+
+```{r Teee detection in bladder tumor healthy tissue}
+bladder.combined_healthy <- AddModuleScore(bladder.combined_healthy, features = teee_list, name= "Teee")
+bladder_healthy_teee_sig <- FeaturePlot(object = bladder.combined_healthy, features = "Teee1", cols = c("blue", "light blue",
+                                                         "orange", "red"))  +
+  labs(title = "Cells Enriched in Teee Signature (Healthy)") + theme(legend.position= c(0.9,0.83))
+pdf("Final_Bladder_Healthy_Teee_Sig.pdf", height = 8, width = 8)
+bladder_healthy_teee_sig
+dev.off()
+
+```
+
+
+Finish analysis by looking at a NSCLC dataset GSE179994
+
+```{r Read in NSCLC data and format}
+NSCLC_counts <- readRDS("GSE179994_all.Tcell.rawCounts.rds.gz")
+NSCLC_meta <- read.delim("GSE179994_Tcell.metadata.tsv.gz")
+NSCLC_meta$celltype <- replace_na(NSCLC_meta$celltype, "None" )
+NSCLC_meta$cluster <- replace_na(NSCLC_meta$cluster, "None" )
+NSCLC_meta[c('Patient_1', 'Time')] <- str_split_fixed(NSCLC_meta$sample, "\\.", 2)
+NSCLC_meta %<>% mutate(Response= case_when(sample == "P1.pre" ~ "Responder", 
+                                           sample == "P1.post.1" ~ "Responder", 
+                                           sample == "P1.post.2" ~ "Responder",
+                                           sample == "P1.post.3" ~ "Non_Responder",
+                                           sample == "P10.pre"  ~ "Responder",
+                                           sample == "P10.post.1"  ~ "Responder",
+                                           sample == "P13.pre" ~ "Responder",
+                                           sample == "P13.post.1" ~ "Responder",
+                                           sample == "P13.post.2"  ~ "Non_Responder",
+                                           sample == "P19.pre"  ~ "Responder",
+                                           sample == "P19.post.1"  ~ "Responder",
+                                           sample == "P29.pre"  ~ "Responder",
+                                           sample == "P29.post.1"  ~ "Responder",
+                                           sample == "P30.pre"  ~ "Responder",
+                                           sample == "P30.post.1"  ~ "Responder",
+                                           sample == "P33.pre"  ~ "Responder",
+                                           sample == "P33.post.1"  ~ "Responder",
+                                           sample == "P35.pre"  ~ "Responder",
+                                           sample == "P35.post.1"  ~ "Responder",
+                                           sample == "P36.post.1"  ~ "Non_Responder",
+                                           sample == "P37.post.1"  ~ "Non_Responder",
+                                           sample == "P38.post.1"  ~ "Non_Responder",
+                                    TRUE ~ "None"))
+
+```
+
+Create seurat object from NSCLC data.
+
+```{r Seurat object NSCLC Data}
+lung <- CreateSeuratObject(counts = NSCLC_counts, project = "lung", min.cells = 10, min.features = 10)
+lung <- AddMetaData(lung, NSCLC_meta$patient, col.name = "Patient" )
+lung <- AddMetaData(lung, NSCLC_meta$sample, col.name = "Sample" )
+lung <- AddMetaData(lung, NSCLC_meta$Time, col.name = "Time" )
+lung <- AddMetaData(lung, NSCLC_meta$Response, col.name = "Response" )
+names <- rownames(lung@assays$RNA)
+```
+
+Check cell viability of NSCLC dataset.
+
+```{r Cell viability of NSCLC Data}
+grep(glob2rx("*ATP6"), names, value = TRUE) 
+#Mito prefix is MT-
+lung[["percent.mt"]] <- PercentageFeatureSet(lung, pattern = "^MT-")
+Idents(object = lung) <- "lung"
+VlnPlot(lung, "percent.mt", raster = FALSE) 
+```
+
+Low viability cells will need to be removed. 
+Will subset CD4+ cells. 
+
+```{r Subsetting NSCLC Data}
+lung_sub <- subset(lung, subset = percent.mt < 10 & CD3E > 1 & CD4 > 2 & CD8A < 1)
+lung_sub <- FindVariableFeatures(lung_sub, selection.method = "vst", nfeatures = 2000)
+lung_sub <- ScaleData(lung_sub)
+lung_sub<- RunPCA(lung_sub, features = VariableFeatures(object = lung_sub))
+ElbowPlot(lung_sub)
+```
+
+Create UMAP from CD4+ NSCLC cells. 
+
+
+```{r UMAP from NSCLC Data, message = FALSE, results = "hide"}
+lung_sub <- FindNeighbors(lung_sub, dims = 1:12)
+lung_sub <- FindClusters(lung_sub, resolution = 0.5)
+lung_sub <- RunUMAP(lung_sub, dims = 1:12)
+umap <- DimPlot(lung_sub, reduction = "umap", label = TRUE)
+umap
+pdf("Final_NSCLC_UMAP.pdf", height = 8, width = 8)
+umap
+dev.off()
+```
+
+
+Assess patient bias in NSCLC data.
+
+```{r Patient bias NSCLC}
+DimPlot(
+  lung_sub,
+  reduction = "umap",
+  group.by = "Patient",
+  label = FALSE)  +
+  theme(legend.position= c(10,10)) + theme(plot.title = element_blank())
+```
+
+
+Identifying Teee cells in the NSCLC data. 
+
+```{r Identifying Teee in NSCLC, message = FALSE}
+lung_sub <- AddModuleScore(lung_sub, features = Teee_list, name= "Teee")
+teee_nsclc <- FeaturePlot(object = lung_sub, features = "Teee1", cols = c("blue", "light blue",
+                                                           "orange", "red"))  +
+  labs(title = "Cells Enriched in Teee Signature (NSCLC)") + theme(legend.position= c(0.9,0.85))
+pdf("Final_NSCLC_Teee_sig.pdf", height = 8, width = 8)
+teee_nsclc
+dev.off()
+```
+
+Create dotplot of the NSCLC data. 
+
+``` {r NSCLC dotplot}
+Teee_select_genes <- c("CD38", "ENTPD1", "MKI67", "PCNA", "TOP2A", "CTLA4", "PDCD1", "LAG3", "HAVCR2", 
+                       "ICOS", "CD274", "PDCD1LG2", "TOX", "TCF7", "CASP3", "BCL2", "IFNG", "TNF", 
+                       "TGFB1", "IL2RA", "FOXP3")
+
+NSCLC_dotplot <- DotPlot(lung_sub, features = Teee_select_genes, dot.scale = 10, scale = TRUE) +
+  RotatedAxis() + scale_color_gradientn(colours = c("black", "dark blue", "light blue", "grey", "yellow", "orange", "red", "dark red"))
+pdf("Final_NSCLC_dotplot_1.27_noLag3.pdf", height = 8, width = 8)
+NSCLC_dotplot
+dev.off()
+```
+
+
+Create all possible correlations between Teee cells and Treg cells for all tumor  types
+```{r All correlations}
+####Melanoma 1 data 
+treg <- subset(x = melanoma_sub, subset = (seurat_clusters == 5 | seurat_clusters == 4))
+teee_cluster <- subset(x = melanoma_sub, subset = seurat_clusters == 6)
+
+treg_counts <- GetAssayData(object = treg, slot = "scale.data")
+treg_means <- rowMeans(treg_counts)
+treg_means <- as.data.frame(treg_means)
+treg_means[2] <- rownames(treg_means)
+teee_counts <- GetAssayData(object = teee_cluster, slot = "scale.data")
+teee_means <- rowMeans(teee_counts)
+teee_means_melanoma <- as.data.frame(teee_means)
+teee_means_melanoma[2] <- rownames(teee_means_melanoma)
+
+###Melanoma 2 data 
+teee_cluster_2 <- subset(x = melanoma_new_sub, subset = seurat_clusters == 9)
+treg_melanoma_2 <- subset(x = melanoma_new_sub, subset = seurat_clusters == 1)
+
+teee_counts_2 <- GetAssayData(object = teee_cluster_2, slot = "scale.data")
+treg_counts_melanoma_2 <- GetAssayData(object = treg_melanoma_2, slot = "scale.data")
+treg_means_melanoma_2 <- rowMeans(treg_counts_melanoma_2)
+treg_means_melanoma_2 <- as.data.frame(treg_means_melanoma_2)
+treg_means_melanoma_2[2] <- rownames(treg_means_melanoma_2)
+teee_means_2 <- rowMeans(teee_counts_2)
+teee_means_melanoma_2 <- as.data.frame(teee_means_2)
+teee_means_melanoma_2[2] <- rownames(teee_means_melanoma_2)
+
+###Lung data 
+teee_cluster_lung <- subset(x = lung_sub, subset = seurat_clusters == 5)
+treg_lung <- subset(x = lung_sub, subset = seurat_clusters == 0)
+teee_counts_lung <- GetAssayData(object = teee_cluster_lung, slot = "scale.data")
+treg_counts_lung <- GetAssayData(object = treg_lung, slot = "scale.data")
+treg_means_lung <- rowMeans(treg_counts_lung)
+treg_means_lung <- as.data.frame(treg_means_lung)
+treg_means_lung[2] <- rownames(treg_means_lung)
+teee_means_lung <- rowMeans(teee_counts_lung)
+teee_means_lung <- as.data.frame(teee_means_lung)
+teee_means_lung[2] <- rownames(teee_means_lung)
+
+###Bladder data 
+teee_cluster_bladder <- subset(x = bladder.combined, subset = seurat_clusters == 9)
+treg_bladder <- subset(x = bladder.combined, subset = (seurat_clusters == 1 | seurat_clusters == 3))
+teee_counts_bladder <- GetAssayData(object = teee_cluster_bladder, slot = "scale.data")
+treg_counts_bladder <- GetAssayData(object = treg_bladder, slot = "scale.data")
+treg_means_bladder <- rowMeans(treg_counts_bladder)
+treg_means_bladder <- as.data.frame(treg_means_bladder)
+treg_means_bladder[2] <- rownames(treg_means_bladder)
+teee_means_bladder <- rowMeans(teee_counts_bladder)
+teee_means_bladder <- as.data.frame(teee_means_bladder)
+teee_means_bladder[2] <- rownames(teee_means_bladder)
+
+#Correlations
+total_teee_treg <- join(treg_means, treg_means_melanoma_2, by = "V2")
+total_teee_treg <- join(total_teee_treg, treg_means_lung, by = "V2")
+total_teee_treg <- join(total_teee_treg, treg_means_bladder, by = "V2")
+total_teee_treg <- join(total_teee_treg, teee_means_melanoma, by = "V2")
+total_teee_treg <- join(total_teee_treg, teee_means_melanoma_2, by = "V2")
+total_teee_treg <- join(total_teee_treg, teee_means_lung, by = "V2")
+total_teee_treg <- join(total_teee_treg, teee_means_bladder, by = "V2")
+
+total_teee_treg <- total_teee_treg[,-2]
+res <- cor(total_teee_treg, method = "spearman", use = "complete.obs")
+
+corrplot(res, method = "shade", type = "upper", order = "hclust", 
+         tl.col = "black", tl.srt = 45, shade.lwd = 0.00000000001)
+
+pdf("Teee Treg correlation.pdf", height = 8, width = 8)
+corrplot(res, method = "shade", type = "upper", order = "hclust", 
+         tl.col = "black", tl.srt = 45, shade.lwd = 0)
+dev.off()
+
+```
+
+
+Further demonstrate differences between Tregs and Teee cells
+```{r Teee vs Treg DEGs}
+###Melanoma Dataset 1
+teee_vs_treg_melanoma <- FindMarkers(melanoma_sub, ident.1 = 6, ident.2 = 5)
+teee_vs_treg_melanoma[6] <- rownames(teee_vs_treg_melanoma)
+teee_vs_treg_melanoma <- as_tibble(teee_vs_treg_melanoma)
+keyvals <- ifelse(teee_vs_treg_melanoma$avg_log2FC < -0.5 & teee_vs_treg_melanoma$p_val_adj < 0.1, 'royalblue',
+                  ifelse(teee_vs_treg_melanoma$avg_log2FC > 0.50 & teee_vs_treg_melanoma$p_val_adj < 0.1, 'red2',
+                         'grey30'))
+keyvals[is.na(keyvals)] <- 'grey30'
+names(keyvals)[keyvals == 'red2'] <- 'Upregulated Teee'
+names(keyvals)[keyvals == 'grey30'] <- 'Non-sig'
+names(keyvals)[keyvals == 'royalblue'] <- 'Upregulated Treg'
+
+melanoma_volcano <- EnhancedVolcano(teee_vs_treg_melanoma,
+                lab = teee_vs_treg_melanoma$V6,
+                x = "avg_log2FC",
+                y = "p_val_adj", ylab = bquote(~-Log[10] ~ p_val_adj),
+                title = "Teee vs Treg Melanoma 1", 
+                subtitle = "", subtitleLabSize = 0.01,
+                cutoffLineType = 'blank',
+                colCustom = keyvals, legendPosition = 'right', 
+                xlim = c(-2,4), ylim = c(0, 75),
+                border = 'full', borderWidth = 0.5, borderColour = 'black',
+                legendLabSize = 11, legendIconSize = 2, caption = "", captionLabSize = 0.0000001, 
+                pCutoff = 0.1,FCcutoff = c(1,2), labSize = 5, drawConnectors = TRUE, arrowheads=FALSE, max.overlaps = 25, 
+                selectLab = c("FOXP3", 
+                              "CXCR6",  "CXCR3", "CCR2", "CTLA4", 
+                              "TNFRSF4",  "IL2RA", "IL2RB", "IKZF2", 
+                              "TNFRSF18", "TNFRSF9", "TNFRSF1B", "FURIN", "CDT1", 
+                              "GCK", "TAFA1", "PCLAF", "CCNA2", "MCM4", "ABCB10", 
+                              "KIF4A", "DHFR", "STK39", "PCNA", "ACOT7" ))
+
+###Melanoma Dataset 2
+teee_vs_treg_melanoma_2 <- FindMarkers(melanoma_new_sub, ident.1 = 9, ident.2 = 1)
+teee_vs_treg_melanoma_2[6] <- rownames(teee_vs_treg_melanoma_2)
+teee_vs_treg_melanoma_2 <- as_tibble(teee_vs_treg_melanoma_2)
+keyvals <- ifelse(teee_vs_treg_melanoma_2$avg_log2FC < -0.5 & teee_vs_treg_melanoma_2$p_val_adj < 0.1, 'royalblue',
+                  ifelse(teee_vs_treg_melanoma_2$avg_log2FC > 0.50 & teee_vs_treg_melanoma_2$p_val_adj < 0.1, 'red2',
+                         'grey30'))
+keyvals[is.na(keyvals)] <- 'grey30'
+names(keyvals)[keyvals == 'red2'] <- 'Upregulated Teee'
+names(keyvals)[keyvals == 'grey30'] <- 'Non-sig'
+names(keyvals)[keyvals == 'royalblue'] <- 'Upregulated Treg'
+
+melanoma_2_volcano <- EnhancedVolcano(teee_vs_treg_melanoma_2,
+                lab = teee_vs_treg_melanoma_2$V6,
+                x = "avg_log2FC",
+                y = "p_val_adj", ylab = bquote(~-Log[10] ~ p_val_adj),
+                title = "Teee vs Treg Melanoma Dataset 2", 
+                subtitle = "", subtitleLabSize = 0.01,
+                cutoffLineType = 'blank',
+                colCustom = keyvals, legendPosition = 'right', 
+                xlim = c(-2,2), ylim = c(0, 35),
+                border = 'full', borderWidth = 0.5, borderColour = 'black',
+                legendLabSize = 11, legendIconSize = 2, caption = "", captionLabSize = 0.0000001, 
+                pCutoff = 0.1,FCcutoff = c(1,2), labSize = 5, drawConnectors = TRUE, arrowheads=FALSE, max.overlaps = 25, 
+                selectLab = c("FOXP3", 
+                              "CXCR6",  "CXCR3", "CCR2", "CTLA4", 
+                              "TNFRSF4",  "IL2RA", "IL2RB", "IKZF2", 
+                              "TNFRSF18", "TNFRSF9", "TNFRSF1B", "FURIN", "CDT1", 
+                              "GCK", "TAFA1", "PCLAF", "CCNA2", "MCM4", "ABCB10", 
+                              "KIF4A", "DHFR", "STK39", "PCNA", "ACOT7" ))
+
+###Bladder
+teee_vs_treg_bladder <- FindMarkers(bladder.combined, ident.1 = 9, ident.2 = 1)
+teee_vs_treg_bladder[6] <- rownames(teee_vs_treg_bladder)
+teee_vs_treg_bladder <- as_tibble(teee_vs_treg_bladder)
+keyvals <- ifelse(teee_vs_treg_bladder$avg_log2FC < -0.5 & teee_vs_treg_bladder$p_val_adj < 0.1, 'royalblue',
+                  ifelse(teee_vs_treg_bladder$avg_log2FC > 0.50 & teee_vs_treg_bladder$p_val_adj < 0.1, 'red2',
+                         'grey30'))
+keyvals[is.na(keyvals)] <- 'grey30'
+names(keyvals)[keyvals == 'red2'] <- 'Upregulated Teee'
+names(keyvals)[keyvals == 'grey30'] <- 'Non-sig'
+names(keyvals)[keyvals == 'royalblue'] <- 'Upregulated Treg'
+
+bladder_volcano <- EnhancedVolcano(teee_vs_treg_bladder,
+                lab = teee_vs_treg_bladder$V6,
+                x = "avg_log2FC",
+                y = "p_val_adj", ylab = bquote(~-Log[10] ~ p_val_adj),
+                title = "Teee vs Treg Bladder", 
+                subtitle = "", subtitleLabSize = 0.01,
+                cutoffLineType = 'blank',
+                colCustom = keyvals, legendPosition = 'right', 
+                xlim = c(-2,3), ylim = c(0, 30),
+                border = 'full', borderWidth = 0.5, borderColour = 'black',
+                legendLabSize = 11, legendIconSize = 2, caption = "", captionLabSize = 0.0000001, 
+                pCutoff = 0.1,FCcutoff = c(1,2), labSize = 5, drawConnectors = TRUE, arrowheads=FALSE, max.overlaps = 25, 
+                selectLab = c("FOXP3", 
+                              "CXCR6",  "CXCR3", "CCR2", "CTLA4", 
+                              "TNFRSF4",  "IL2RA", "IL2RB", "IKZF2", 
+                              "TNFRSF18", "TNFRSF9", "TNFRSF1B", "FURIN", "CDT1", 
+                              "GCK", "TAFA1", "PCLAF", "CCNA2", "MCM4", "ABCB10", 
+                              "KIF4A", "DHFR", "STK39", "PCNA", "ACOT7" ))
+
+###Lung Dataset
+teee_vs_treg_lung <- FindMarkers(lung_sub, ident.1 = 5, ident.2 = 0)
+teee_vs_treg_lung[6] <- rownames(teee_vs_treg_lung)
+teee_vs_treg_lung <- as_tibble(teee_vs_treg_lung)
+keyvals <- ifelse(teee_vs_treg_lung$avg_log2FC < -0.5 & teee_vs_treg_lung$p_val_adj < 0.1, 'royalblue',
+                  ifelse(teee_vs_treg_lung$avg_log2FC > 0.50 & teee_vs_treg_lung$p_val_adj < 0.1, 'red2',
+                         'grey30'))
+keyvals[is.na(keyvals)] <- 'grey30'
+names(keyvals)[keyvals == 'red2'] <- 'Upregulated Teee'
+names(keyvals)[keyvals == 'grey30'] <- 'Non-sig'
+names(keyvals)[keyvals == 'royalblue'] <- 'Upregulated Treg'
+
+lung_volcano <- EnhancedVolcano(teee_vs_treg_lung,
+                lab = teee_vs_treg_lung$V6,
+                x = "avg_log2FC",
+                y = "p_val_adj", ylab = bquote(~-Log[10] ~ p_val_adj),
+                title = "Teee vs Treg Lung", 
+                subtitle = "", subtitleLabSize = 0.01,
+                cutoffLineType = 'blank',
+                colCustom = keyvals, legendPosition = 'right', 
+                xlim = c(-2,5), ylim = c(0, 105),
+                border = 'full', borderWidth = 0.5, borderColour = 'black',
+                legendLabSize = 11, legendIconSize = 2, caption = "", captionLabSize = 0.0000001, 
+                pCutoff = 0.1,FCcutoff = c(1,2), labSize = 5, drawConnectors = TRUE, arrowheads=FALSE, max.overlaps = 25, 
+                selectLab = c("FOXP3", 
+                              "CXCR6",  "CXCR3", "CCR2", "CTLA4", 
+                              "TNFRSF4",  "IL2RA", "IL2RB", "IKZF2", 
+                              "TNFRSF18", "TNFRSF9", "TNFRSF1B", "FURIN", "CDT1", 
+                              "GCK", "TAFA1", "PCLAF", "CCNA2", "MCM4", "ABCB10", 
+                              "KIF4A", "DHFR", "STK39", "PCNA", "ACOT7" ))
+
+pdf("Melanoma 1 Volcano.pdf", height = 8, width = 8)
+melanoma_volcano
+dev.off()
+
+pdf("Melanoma 2 Volcano.pdf", height = 8, width = 8)
+melanoma_2_volcano
+dev.off()
+
+pdf("Bladder Volcano.pdf", height = 8, width = 8)
+bladder_volcano
+dev.off()
+
+pdf("Lung Volcano.pdf", height = 8, width = 8)
+lung_volcano
+dev.off()
+
+```
+
+
+
