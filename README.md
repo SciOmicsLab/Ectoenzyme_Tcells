@@ -1,4 +1,7 @@
 # Ectoenzyme_Tcells
 Analysis materials associated with XXX publication. 
 
-ADD GEO Info
+Bulk RNA-Seq: GSE224099
+
+scRNA-Seq (from other groups):
+
