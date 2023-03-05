@@ -4,6 +4,7 @@ Analysis materials associated with XXX publication.
 Bulk RNA-Seq: GSE224099
 
 scRNA-Seq (from other groups):
+
 GSE11597823 
 Jerby-Arnon, L. et al. A Cancer Cell Program Promotes T Cell Exclusion and Resistance to Checkpoint Blockade. Cell 175, 984-997 e924 (2018). https://doi.org:10.1016/j.cell.2018.09.006
 
